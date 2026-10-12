@@ -1,0 +1,147 @@
+name: Build APK
+on:
+  workflow_dispatch:
+    inputs:
+      app_name:
+        description: 'Nome do jogo'
+        required: true
+        default: 'Meu Jogo'
+      app_package:
+        description: 'ID do app (minusculas, ex: com.taru.jogo1)'
+        required: true
+        default: 'com.taru.jogo1'
+      orientation:
+        description: 'Orientacao da tela'
+        required: true
+        default: 'landscape'
+        type: choice
+        options:
+          - landscape
+          - portrait
+          - unspecified
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+      - name: Montar projeto Android
+        env:
+          APP_NAME: ${{ inputs.app_name }}
+          APP_PACKAGE: ${{ inputs.app_package }}
+          ORI: ${{ inputs.orientation }}
+        run: |
+          set -e
+          test -f index.html || { echo "ERRO: falta o arquivo index.html na raiz do repositorio"; exit 1; }
+          APP_NAME=$(printf '%s' "$APP_NAME" | tr -cd '[:alnum:] ._-')
+          APP_PACKAGE=$(printf '%s' "$APP_PACKAGE" | tr -d ' ')
+          echo "$APP_PACKAGE" | grep -Eq '^[a-z][a-z0-9]*(\.[a-z][a-z0-9]*)+$' || { echo "ERRO: ID invalido. Use minusculas, ponto e sem numero no comeco de cada parte. Ex: com.taru.jogo1"; exit 1; }
+          mkdir -p proj/app/src/main/assets proj/app/src/main/java/com/taru/jogo
+          cp index.html proj/app/src/main/assets/index.html
+          cd proj
+          cat > settings.gradle <<'EOT'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "Jogo"
+          include ":app"
+          EOT
+          cat > build.gradle <<'EOT'
+          plugins { id 'com.android.application' version '8.5.2' apply false }
+          EOT
+          printf 'org.gradle.jvmargs=-Xmx2g\n' > gradle.properties
+          cat > app/build.gradle <<'EOT'
+          plugins { id 'com.android.application' }
+          android {
+              namespace 'com.taru.jogo'
+              compileSdk 34
+              defaultConfig {
+                  applicationId "__PKG__"
+                  minSdk 21
+                  targetSdk 34
+                  versionCode 1
+                  versionName "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+          }
+          EOT
+          cat > app/src/main/AndroidManifest.xml <<'EOT'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <application
+                  android:label="__NAME__"
+                  android:theme="@android:style/Theme.NoTitleBar.Fullscreen"
+                  android:hardwareAccelerated="true">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:screenOrientation="__ORI__"
+                      android:configChanges="orientation|screenSize|keyboardHidden">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN"/>
+                          <category android:name="android.intent.category.LAUNCHER"/>
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOT
+          sed -i "s|__PKG__|$APP_PACKAGE|; s|__NAME__|$APP_NAME|; s|__ORI__|$ORI|" app/build.gradle app/src/main/AndroidManifest.xml
+          cat > app/src/main/java/com/taru/jogo/MainActivity.java <<'EOT'
+          package com.taru.jogo;
+
+          import android.app.Activity;
+          import android.os.Bundle;
+          import android.view.View;
+          import android.webkit.WebSettings;
+          import android.webkit.WebView;
+          import android.webkit.WebViewClient;
+
+          public class MainActivity extends Activity {
+              private WebView web;
+
+              @Override
+              protected void onCreate(Bundle b) {
+                  super.onCreate(b);
+                  web = new WebView(this);
+                  setContentView(web);
+                  WebSettings s = web.getSettings();
+                  s.setJavaScriptEnabled(true);
+                  s.setDomStorageEnabled(true);
+                  s.setMediaPlaybackRequiresUserGesture(false);
+                  s.setAllowFileAccess(true);
+                  web.setWebViewClient(new WebViewClient());
+                  web.loadUrl("file:///android_asset/index.html");
+                  hideBars();
+              }
+
+              private void hideBars() {
+                  getWindow().getDecorView().setSystemUiVisibility(
+                      View.SYSTEM_UI_FLAG_FULLSCREEN | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
+                      | View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY | View.SYSTEM_UI_FLAG_LAYOUT_STABLE);
+              }
+
+              @Override public void onWindowFocusChanged(boolean f) { super.onWindowFocusChanged(f); if (f) hideBars(); }
+              @Override public void onBackPressed() { if (web.canGoBack()) web.goBack(); else super.onBackPressed(); }
+              @Override protected void onPause() { super.onPause(); web.onPause(); }
+              @Override protected void onResume() { super.onResume(); web.onResume(); }
+          }
+          EOT
+      - name: Compilar APK
+        working-directory: proj
+        run: gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: jogo-apk
+          path: proj/app/build/outputs/apk/debug/*.apk
