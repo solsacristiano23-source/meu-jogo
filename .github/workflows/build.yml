@@ -1,3 +1,4 @@
+# motor v3
 name: Build APK
 on:
   workflow_dispatch:
@@ -20,15 +21,9 @@ on:
           - portrait
           - unspecified
       permissions:
-        description: 'Permissoes extras (gravacao de audio/camera)'
-        required: true
-        default: 'nenhuma'
-        type: choice
-        options:
-          - nenhuma
-          - internet
-          - internet+microfone
-          - internet+microfone+camera
+        description: 'Recursos: internet, microfone, camera, localizacao, notificacoes, flutuante (separe por virgula)'
+        required: false
+        default: ''
       protect:
         description: 'Ofuscar o codigo (dificulta copia)'
         type: boolean
@@ -157,6 +152,7 @@ jobs:
           import android.util.Base64;
           import android.view.View;
           import android.view.WindowManager;
+          import android.webkit.GeolocationPermissions;
           import android.webkit.JavascriptInterface;
           import android.webkit.PermissionRequest;
           import android.webkit.URLUtil;
@@ -180,18 +176,63 @@ jobs:
           import java.util.List;
 
           public class MainActivity extends Activity {
-              private static final int REQ_FILE = 11, REQ_PERM = 12;
+              static MainActivity current;
+              private static final int REQ_FILE = 11, REQ_PERM = 12, REQ_JS = 13, REQ_GEO = 14;
               private static final String HOST = "appassets.androidplatform.net";
               private WebView web;
               private FrameLayout root;
               private ImageView splash;
               private ValueCallback<Uri[]> fileCb;
               private PermissionRequest pendingPerm;
+              private String pendingJsPerm, geoOrigin;
+              private GeolocationPermissions.Callback geoCb;
               private long backAt = 0, startAt;
               private String hookJs = "";
+              boolean keepRunning = false;
+
+              static void callJs(final String code) {
+                  final MainActivity m = current;
+                  if (m != null && m.web != null) m.web.post(() -> m.web.evaluateJavascript(code, null));
+              }
+
+              static String[] permsFor(String name) {
+                  switch (name) {
+                      case "camera": return new String[]{Manifest.permission.CAMERA};
+                      case "microfone": return new String[]{Manifest.permission.RECORD_AUDIO};
+                      case "localizacao": return new String[]{Manifest.permission.ACCESS_FINE_LOCATION};
+                      case "notificacoes": return Build.VERSION.SDK_INT >= 33 ? new String[]{"android.permission.POST_NOTIFICATIONS"} : new String[0];
+                      default: return null;
+                  }
+              }
+
+              boolean hasPermission(String name) {
+                  String[] p = permsFor(name);
+                  if (p == null) return false;
+                  for (String s : p) if (checkSelfPermission(s) != PackageManager.PERMISSION_GRANTED) return false;
+                  return true;
+              }
+
+              void askPermission(String rawName) {
+                  final String name = rawName == null ? "" : rawName.replaceAll("[^a-z]", "");
+                  runOnUiThread(() -> {
+                      if (hasPermission(name)) { callJs("window.onPermissao&&window.onPermissao('" + name + "',true)"); return; }
+                      String[] p = permsFor(name);
+                      if (p == null) { callJs("window.onPermissao&&window.onPermissao('" + name + "',false)"); return; }
+                      pendingJsPerm = name;
+                      requestPermissions(p, REQ_JS);
+                  });
+              }
+
+              void setKeepScreenOn(final boolean on) {
+                  runOnUiThread(() -> {
+                      if (on) getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+                      else getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+                  });
+              }
 
               @Override protected void onCreate(Bundle b) {
                   super.onCreate(b);
+                  current = this;
                   startAt = System.currentTimeMillis();
                   getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
                   try {
@@ -212,6 +253,7 @@ jobs:
                   WebSettings s = web.getSettings();
                   s.setJavaScriptEnabled(true);
                   s.setDomStorageEnabled(true);
+                  s.setGeolocationEnabled(true);
                   s.setMediaPlaybackRequiresUserGesture(false);
                   s.setSupportZoom(false);
                   s.setBuiltInZoomControls(false);
@@ -219,6 +261,7 @@ jobs:
                   web.setOnLongClickListener(v -> true);
                   web.setHapticFeedbackEnabled(false);
                   web.addJavascriptInterface(new Bridge(), "AndroidBridge");
+                  web.addJavascriptInterface(new Nativo(this), "Nativo");
 
                   final WebViewAssetLoader loader = new WebViewAssetLoader.Builder()
                       .addPathHandler("/assets/", new WebViewAssetLoader.AssetsPathHandler(this)).build();
@@ -248,6 +291,12 @@ jobs:
                               }
                               if (missing.isEmpty()) { req.grant(req.getResources()); }
                               else { pendingPerm = req; requestPermissions(missing.toArray(new String[0]), REQ_PERM); }
+                          });
+                      }
+                      @Override public void onGeolocationPermissionsShowPrompt(final String origin, final GeolocationPermissions.Callback cb) {
+                          runOnUiThread(() -> {
+                              if (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED) cb.invoke(origin, true, false);
+                              else { geoOrigin = origin; geoCb = cb; requestPermissions(new String[]{Manifest.permission.ACCESS_FINE_LOCATION}, REQ_GEO); }
                           });
                       }
                       @Override public boolean onShowFileChooser(WebView w, ValueCallback<Uri[]> cb, FileChooserParams p) {
@@ -351,11 +400,17 @@ jobs:
 
               @Override public void onRequestPermissionsResult(int code, String[] perms, int[] res) {
                   super.onRequestPermissionsResult(code, perms, res);
+                  boolean ok = res.length > 0;
+                  for (int r : res) if (r != PackageManager.PERMISSION_GRANTED) ok = false;
                   if (code == REQ_PERM && pendingPerm != null) {
-                      boolean ok = res.length > 0;
-                      for (int r : res) if (r != PackageManager.PERMISSION_GRANTED) ok = false;
                       if (ok) pendingPerm.grant(pendingPerm.getResources()); else pendingPerm.deny();
                       pendingPerm = null;
+                  } else if (code == REQ_JS && pendingJsPerm != null) {
+                      callJs("window.onPermissao&&window.onPermissao('" + pendingJsPerm + "'," + ok + ")");
+                      pendingJsPerm = null;
+                  } else if (code == REQ_GEO && geoCb != null) {
+                      geoCb.invoke(geoOrigin, ok, false);
+                      geoCb = null;
                   }
               }
 
@@ -369,9 +424,278 @@ jobs:
               }
 
               @Override public void onWindowFocusChanged(boolean f) { super.onWindowFocusChanged(f); if (f) hideBars(); }
-              @Override protected void onPause() { super.onPause(); web.onPause(); web.pauseTimers(); }
+              @Override protected void onPause() { super.onPause(); if (!keepRunning) { web.onPause(); web.pauseTimers(); } }
               @Override protected void onResume() { super.onResume(); web.onResume(); web.resumeTimers(); }
-              @Override protected void onDestroy() { super.onDestroy(); web.destroy(); }
+              @Override protected void onDestroy() { if (current == this) current = null; super.onDestroy(); web.destroy(); }
+          }
+          EOT
+          cat > app/src/main/java/com/taru/jogo/Nativo.java <<'EOT'
+          package com.taru.jogo;
+
+          import android.app.ActivityManager;
+          import android.content.ClipData;
+          import android.content.ClipboardManager;
+          import android.content.Context;
+          import android.content.Intent;
+          import android.content.IntentFilter;
+          import android.content.pm.PackageInfo;
+          import android.net.ConnectivityManager;
+          import android.net.Network;
+          import android.net.NetworkCapabilities;
+          import android.net.Uri;
+          import android.os.BatteryManager;
+          import android.os.Build;
+          import android.os.VibrationEffect;
+          import android.os.Vibrator;
+          import android.provider.Settings;
+          import android.util.DisplayMetrics;
+          import android.webkit.JavascriptInterface;
+          import android.widget.Toast;
+          import java.util.Locale;
+          import java.util.TimeZone;
+          import org.json.JSONObject;
+
+          public class Nativo {
+              private final MainActivity a;
+              Nativo(MainActivity a) { this.a = a; }
+
+              @JavascriptInterface public String info() {
+                  try {
+                      JSONObject o = new JSONObject();
+                      o.put("modelo", Build.MODEL);
+                      o.put("fabricante", Build.MANUFACTURER);
+                      o.put("androidVersao", Build.VERSION.RELEASE);
+                      o.put("sdk", Build.VERSION.SDK_INT);
+                      o.put("idioma", Locale.getDefault().toLanguageTag());
+                      o.put("fusoHorario", TimeZone.getDefault().getID());
+                      DisplayMetrics dm = a.getResources().getDisplayMetrics();
+                      o.put("telaLargura", dm.widthPixels);
+                      o.put("telaAltura", dm.heightPixels);
+                      o.put("densidade", dm.density);
+                      Intent b = a.registerReceiver(null, new IntentFilter(Intent.ACTION_BATTERY_CHANGED));
+                      if (b != null) {
+                          int l = b.getIntExtra(BatteryManager.EXTRA_LEVEL, -1), s = b.getIntExtra(BatteryManager.EXTRA_SCALE, 100);
+                          int st = b.getIntExtra(BatteryManager.EXTRA_STATUS, -1);
+                          o.put("bateria", s > 0 ? l * 100 / s : -1);
+                          o.put("carregando", st == BatteryManager.BATTERY_STATUS_CHARGING || st == BatteryManager.BATTERY_STATUS_FULL);
+                      }
+                      ActivityManager am = (ActivityManager) a.getSystemService(Context.ACTIVITY_SERVICE);
+                      ActivityManager.MemoryInfo mi = new ActivityManager.MemoryInfo();
+                      am.getMemoryInfo(mi);
+                      o.put("memoriaTotalMB", mi.totalMem / 1048576);
+                      o.put("memoriaLivreMB", mi.availMem / 1048576);
+                      o.put("rede", rede());
+                      o.put("pacote", a.getPackageName());
+                      try {
+                          PackageInfo pi = a.getPackageManager().getPackageInfo(a.getPackageName(), 0);
+                          o.put("versaoApp", pi.versionName);
+                      } catch (Exception e) { }
+                      o.put("acessibilidadeAtiva", AutoService.instance != null);
+                      return o.toString();
+                  } catch (Exception e) { return "{}"; }
+              }
+
+              private String rede() {
+                  try {
+                      ConnectivityManager cm = (ConnectivityManager) a.getSystemService(Context.CONNECTIVITY_SERVICE);
+                      Network n = cm.getActiveNetwork();
+                      if (n == null) return "nenhuma";
+                      NetworkCapabilities c = cm.getNetworkCapabilities(n);
+                      if (c == null) return "nenhuma";
+                      if (c.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) return "wifi";
+                      if (c.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR)) return "celular";
+                      return "outra";
+                  } catch (Exception e) { return "desconhecida"; }
+              }
+
+              @JavascriptInterface public void pedirPermissao(String nome) { a.askPermission(nome); }
+              @JavascriptInterface public boolean temPermissao(String nome) { return a.hasPermission(nome == null ? "" : nome); }
+
+              @JavascriptInterface public void toast(final String t) {
+                  a.runOnUiThread(() -> Toast.makeText(a, t, Toast.LENGTH_SHORT).show());
+              }
+              @JavascriptInterface public void vibrar(final int ms) {
+                  a.runOnUiThread(() -> {
+                      try {
+                          Vibrator v = (Vibrator) a.getSystemService(Context.VIBRATOR_SERVICE);
+                          if (Build.VERSION.SDK_INT >= 26) v.vibrate(VibrationEffect.createOneShot(ms, VibrationEffect.DEFAULT_AMPLITUDE));
+                          else v.vibrate(ms);
+                      } catch (Exception e) { }
+                  });
+              }
+              @JavascriptInterface public void copiar(final String t) {
+                  a.runOnUiThread(() -> {
+                      ClipboardManager cm = (ClipboardManager) a.getSystemService(Context.CLIPBOARD_SERVICE);
+                      cm.setPrimaryClip(ClipData.newPlainText("texto", t));
+                  });
+              }
+              @JavascriptInterface public void compartilhar(final String t) {
+                  a.runOnUiThread(() -> {
+                      Intent i = new Intent(Intent.ACTION_SEND);
+                      i.setType("text/plain");
+                      i.putExtra(Intent.EXTRA_TEXT, t);
+                      a.startActivity(Intent.createChooser(i, "Compartilhar"));
+                  });
+              }
+              @JavascriptInterface public void abrirLink(final String u) {
+                  a.runOnUiThread(() -> { try { a.startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(u))); } catch (Exception e) { } });
+              }
+              @JavascriptInterface public void minimizar() { a.runOnUiThread(() -> a.moveTaskToBack(true)); }
+              @JavascriptInterface public void sair() { a.runOnUiThread(() -> a.finish()); }
+              @JavascriptInterface public void manterAtivo(boolean on) { a.keepRunning = on; }
+              @JavascriptInterface public void manterTelaLigada(boolean on) { a.setKeepScreenOn(on); }
+
+              /* ---- sobre outros apps e toques automaticos (precisa do servico de acessibilidade ligado) ---- */
+              @JavascriptInterface public boolean acessibilidadeAtiva() { return AutoService.instance != null; }
+              @JavascriptInterface public void abrirAcessibilidade() {
+                  a.runOnUiThread(() -> {
+                      Intent i = new Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS);
+                      i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                      a.startActivity(i);
+                  });
+              }
+              @JavascriptInterface public boolean tocar(float x, float y) {
+                  AutoService s = AutoService.instance;
+                  if (s == null) return false;
+                  s.tap(x, y);
+                  return true;
+              }
+              @JavascriptInterface public boolean deslizar(float x1, float y1, float x2, float y2, int ms) {
+                  AutoService s = AutoService.instance;
+                  if (s == null) return false;
+                  s.swipe(x1, y1, x2, y2, ms);
+                  return true;
+              }
+              @JavascriptInterface public boolean tocarRepetido(float x, float y, int ms) {
+                  AutoService s = AutoService.instance;
+                  if (s == null) return false;
+                  s.startLoop(x, y, ms);
+                  return true;
+              }
+              @JavascriptInterface public void pararToques() {
+                  AutoService s = AutoService.instance;
+                  if (s != null) s.stopLoop();
+              }
+              @JavascriptInterface public boolean mostrarFlutuante(String texto) {
+                  AutoService s = AutoService.instance;
+                  if (s == null) return false;
+                  s.showFloat(texto == null ? "●" : texto);
+                  return true;
+              }
+              @JavascriptInterface public void esconderFlutuante() {
+                  AutoService s = AutoService.instance;
+                  if (s != null) s.hideFloat();
+              }
+          }
+          EOT
+          cat > app/src/main/java/com/taru/jogo/AutoService.java <<'EOT'
+          package com.taru.jogo;
+
+          import android.accessibilityservice.AccessibilityService;
+          import android.accessibilityservice.GestureDescription;
+          import android.graphics.Color;
+          import android.graphics.Path;
+          import android.graphics.PixelFormat;
+          import android.graphics.drawable.GradientDrawable;
+          import android.os.Build;
+          import android.os.Handler;
+          import android.os.Looper;
+          import android.view.Gravity;
+          import android.view.MotionEvent;
+          import android.view.View;
+          import android.view.WindowManager;
+          import android.view.accessibility.AccessibilityEvent;
+          import android.widget.TextView;
+
+          /* Servico de acessibilidade com o minimo de poderes: so faz toques/deslizes e mostra um botao flutuante.
+             Nao le a tela de outros apps (canRetrieveWindowContent = false). */
+          public class AutoService extends AccessibilityService {
+              static AutoService instance;
+              private final Handler h = new Handler(Looper.getMainLooper());
+              private Runnable loop;
+              private View floatView;
+              private WindowManager wm;
+
+              @Override protected void onServiceConnected() { instance = this; super.onServiceConnected(); }
+              @Override public void onAccessibilityEvent(AccessibilityEvent e) { }
+              @Override public void onInterrupt() { }
+              @Override public boolean onUnbind(android.content.Intent i) { stopLoop(); hideFloat(); instance = null; return super.onUnbind(i); }
+              @Override public void onDestroy() { instance = null; super.onDestroy(); }
+
+              void tap(final float x, final float y) { h.post(() -> gesture(x, y, x, y, 40)); }
+              void swipe(final float x1, final float y1, final float x2, final float y2, final int ms) { h.post(() -> gesture(x1, y1, x2, y2, Math.max(ms, 1))); }
+
+              private void gesture(float x1, float y1, float x2, float y2, int ms) {
+                  if (Build.VERSION.SDK_INT < 24) return;
+                  Path p = new Path();
+                  p.moveTo(x1, y1);
+                  if (x1 != x2 || y1 != y2) p.lineTo(x2, y2);
+                  GestureDescription.Builder b = new GestureDescription.Builder();
+                  b.addStroke(new GestureDescription.StrokeDescription(p, 0, ms));
+                  dispatchGesture(b.build(), null, null);
+              }
+
+              void startLoop(final float x, final float y, final int ms) {
+                  stopLoop();
+                  final int gap = Math.max(ms, 50);
+                  loop = new Runnable() { @Override public void run() { gesture(x, y, x, y, 40); h.postDelayed(this, gap); } };
+                  h.post(loop);
+              }
+
+              void stopLoop() {
+                  h.post(() -> { if (loop != null) { h.removeCallbacks(loop); loop = null; } });
+              }
+
+              void showFloat(final String label) {
+                  h.post(() -> {
+                      if (floatView != null) { ((TextView) floatView).setText(label); return; }
+                      wm = (WindowManager) getSystemService(WINDOW_SERVICE);
+                      final TextView t = new TextView(this);
+                      t.setText(label);
+                      t.setTextColor(Color.WHITE);
+                      t.setTextSize(14);
+                      t.setGravity(Gravity.CENTER);
+                      t.setPadding(36, 24, 36, 24);
+                      GradientDrawable gd = new GradientDrawable();
+                      gd.setColor(0xDD7C5CFF);
+                      gd.setCornerRadius(80);
+                      t.setBackground(gd);
+                      final WindowManager.LayoutParams lp = new WindowManager.LayoutParams(
+                          WindowManager.LayoutParams.WRAP_CONTENT, WindowManager.LayoutParams.WRAP_CONTENT,
+                          WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+                          WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE, PixelFormat.TRANSLUCENT);
+                      lp.gravity = Gravity.TOP | Gravity.START;
+                      lp.x = 40;
+                      lp.y = 300;
+                      t.setOnTouchListener(new View.OnTouchListener() {
+                          float sx, sy; int ox, oy; boolean moved;
+                          @Override public boolean onTouch(View v, MotionEvent e) {
+                              switch (e.getAction()) {
+                                  case MotionEvent.ACTION_DOWN: sx = e.getRawX(); sy = e.getRawY(); ox = lp.x; oy = lp.y; moved = false; return true;
+                                  case MotionEvent.ACTION_MOVE:
+                                      if (Math.abs(e.getRawX() - sx) + Math.abs(e.getRawY() - sy) > 12) moved = true;
+                                      lp.x = ox + (int) (e.getRawX() - sx);
+                                      lp.y = oy + (int) (e.getRawY() - sy);
+                                      wm.updateViewLayout(v, lp);
+                                      return true;
+                                  case MotionEvent.ACTION_UP:
+                                      if (!moved) MainActivity.callJs("window.onFlutuanteClick&&window.onFlutuanteClick()");
+                                      return true;
+                                  default: return false;
+                              }
+                          }
+                      });
+                      wm.addView(t, lp);
+                      floatView = t;
+                  });
+              }
+
+              void hideFloat() {
+                  h.post(() -> {
+                      if (floatView != null && wm != null) { try { wm.removeView(floatView); } catch (Exception e) { } }
+                      floatView = null;
+                  });
+              }
           }
           EOT
           python3 - <<'PYGEN'
@@ -397,9 +721,13 @@ jobs:
               if u and not re.match(r'^ca-app-pub-[0-9]{16}/[0-9]{10}$', u):
                   die('ID de bloco AdMob invalido (formato ca-app-pub-0000000000000000/0000000000)')
           ads = bool(app)
-          net = perm.startswith('internet') or ads
-          mic = 'microfone' in perm
-          cam = 'camera' in perm
+          feats = set(re.split(r'[^a-z]+', perm.lower())) - {''}
+          net = 'internet' in feats or ads
+          mic = 'microfone' in feats
+          cam = 'camera' in feats
+          loc = 'localizacao' in feats
+          notif = 'notificacoes' in feats
+          flut = bool(feats & {'flutuante', 'autoclick', 'sobrepor'})
           icon = E.get('HAS_ICON') == '1'
           P = []
           if net:
@@ -411,6 +739,13 @@ jobs:
           if cam:
               P.append('<uses-permission android:name="android.permission.CAMERA"/>')
               P.append('<uses-feature android:name="android.hardware.camera" android:required="false"/>')
+          P.append('<uses-permission android:name="android.permission.VIBRATE"/>')
+          if loc:
+              P.append('<uses-permission android:name="android.permission.ACCESS_FINE_LOCATION"/>')
+              P.append('<uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION"/>')
+          if notif:
+              P.append('<uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>')
+          service = ('<service android:name=".AutoService" android:exported="true" android:label="%s" android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE"><intent-filter><action android:name="android.accessibilityservice.AccessibilityService"/></intent-filter><meta-data android:name="android.accessibilityservice" android:resource="@xml/auto_config"/></service>' % name) if flut else ''
           meta = ('<meta-data android:name="com.google.android.gms.ads.APPLICATION_ID" android:value="%s"/>' % app) if ads else ''
           manifest = '''<?xml version="1.0" encoding="utf-8"?>
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
@@ -432,10 +767,23 @@ jobs:
                           <category android:name="android.intent.category.LAUNCHER"/>
                       </intent-filter>
                   </activity>
+                  %s
               </application>
           </manifest>
-          ''' % ('\n    '.join(P), name, 'android:icon="@mipmap/ic_launcher"' if icon else '', meta, ori)
+          ''' % ('\n    '.join(P), name, 'android:icon="@mipmap/ic_launcher"' if icon else '', meta, ori, service)
           open('app/src/main/AndroidManifest.xml', 'w', encoding='utf-8').write(manifest)
+          if flut:
+              os.makedirs('app/src/main/res/xml', exist_ok=True)
+              os.makedirs('app/src/main/res/values', exist_ok=True)
+              open('app/src/main/res/xml/auto_config.xml', 'w', encoding='utf-8').write('''<?xml version="1.0" encoding="utf-8"?>
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:accessibilityFeedbackType="feedbackGeneric"
+              android:canPerformGestures="true"
+              android:canRetrieveWindowContent="false"
+              android:description="@string/acc_desc"
+              android:notificationTimeout="100"/>
+          ''')
+              open('app/src/main/res/values/strings.xml', 'w', encoding='utf-8').write('<?xml version="1.0" encoding="utf-8"?>\n<resources><string name="acc_desc">Permite que o app %s faca toques automaticos e mostre um botao flutuante. Nao le a tela de outros apps.</string></resources>\n' % name)
           dep = "    implementation 'com.google.android.gms:play-services-ads:23.3.0'\n" if ads else ''
           gradle = '''plugins { id 'com.android.application' }
           android {
@@ -577,7 +925,7 @@ jobs:
           '''
           src = REAL.replace('__BAN__', ban).replace('__INT__', inter).replace('__REW__', rew) if ads else STUB
           open('app/src/main/java/com/taru/jogo/AdsBridge.java', 'w', encoding='utf-8').write(src)
-          print('Projeto montado:', name, pkg, 'icone' if icon else 'sem icone', 'AdMob' if ads else 'sem AdMob')
+          print('Projeto montado:', name, pkg, 'icone' if icon else 'sem icone', 'AdMob' if ads else 'sem AdMob', sorted(feats))
           PYGEN
       - name: Ofuscar codigo
         if: ${{ inputs.protect }}
@@ -604,6 +952,22 @@ jobs:
       - name: Compilar APK
         working-directory: proj
         run: gradle assembleRelease --no-daemon
+      - name: Publicar APK na branch apks
+        continue-on-error: true
+        run: |
+          set -e
+          PUB="$RUNNER_TEMP/pub"
+          mkdir -p "$PUB"
+          cp proj/app/build/outputs/apk/release/*.apk "$PUB/jogo.apk"
+          echo "{\"run_id\":${{ github.run_id }},\"run_number\":${{ github.run_number }}}" > "$PUB/info.json"
+          cd "$PUB"
+          git init -q -b apks
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          git add -A
+          git commit -q -m "apk ${{ github.run_number }}"
+          git remote add origin "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git"
+          git push -f origin apks
       - uses: actions/upload-artifact@v4
         with:
           name: jogo-apk
