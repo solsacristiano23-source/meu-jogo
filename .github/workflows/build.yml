@@ -19,6 +19,42 @@ on:
           - landscape
           - portrait
           - unspecified
+      permissions:
+        description: 'Permissoes extras (gravacao de audio/camera)'
+        required: true
+        default: 'nenhuma'
+        type: choice
+        options:
+          - nenhuma
+          - internet
+          - internet+microfone
+          - internet+microfone+camera
+      protect:
+        description: 'Ofuscar o codigo (dificulta copia)'
+        type: boolean
+        default: false
+      admob_app_id:
+        description: 'AdMob: ID do app (ca-app-pub-...~...). Vazio = sem anuncios'
+        required: false
+        default: ''
+      admob_banner:
+        description: 'AdMob: ID do bloco Banner (opcional)'
+        required: false
+        default: ''
+      admob_interstitial:
+        description: 'AdMob: ID do bloco Intersticial (opcional)'
+        required: false
+        default: ''
+      admob_rewarded:
+        description: 'AdMob: ID do bloco Premiado (opcional)'
+        required: false
+        default: ''
+      version_name:
+        description: 'Versao do jogo'
+        required: false
+        default: '1.0'
+permissions:
+  contents: write
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -31,19 +67,48 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: 8.7
+      - name: Chave de assinatura
+        run: |
+          if [ ! -f keystore.jks ]; then
+            keytool -genkeypair -keystore keystore.jks -storepass senha123 -keypass senha123 -alias key -keyalg RSA -keysize 2048 -validity 36500 -dname "CN=Jogos, O=Jogos"
+            git config user.name "github-actions"
+            git config user.email "actions@github.com"
+            git add keystore.jks
+            git commit -m "chave de assinatura" || true
+            git push || echo "AVISO: nao consegui salvar a chave no repositorio"
+          fi
       - name: Montar projeto Android
         env:
           APP_NAME: ${{ inputs.app_name }}
           APP_PACKAGE: ${{ inputs.app_package }}
           ORI: ${{ inputs.orientation }}
+          PERMS: ${{ inputs.permissions }}
+          VERSION_NAME: ${{ inputs.version_name }}
+          ADMOB_APP: ${{ inputs.admob_app_id }}
+          ADMOB_BANNER: ${{ inputs.admob_banner }}
+          ADMOB_INTER: ${{ inputs.admob_interstitial }}
+          ADMOB_REWARD: ${{ inputs.admob_rewarded }}
+          RUN_NUMBER: ${{ github.run_number }}
         run: |
           set -e
           test -f index.html || { echo "ERRO: falta o arquivo index.html na raiz do repositorio"; exit 1; }
-          APP_NAME=$(printf '%s' "$APP_NAME" | tr -cd '[:alnum:] ._-')
-          APP_PACKAGE=$(printf '%s' "$APP_PACKAGE" | tr -d ' ')
-          echo "$APP_PACKAGE" | grep -Eq '^[a-z][a-z0-9]*(\.[a-z][a-z0-9]*)+$' || { echo "ERRO: ID invalido. Use minusculas, ponto e sem numero no comeco de cada parte. Ex: com.taru.jogo1"; exit 1; }
           mkdir -p proj/app/src/main/assets proj/app/src/main/java/com/taru/jogo
           cp index.html proj/app/src/main/assets/index.html
+          cp keystore.jks proj/keystore.jks
+          HAS_ICON=0
+          for f in capa.png capa.jpg capa.jpeg capa.webp; do
+            if [ -f "$f" ]; then CAPA="$f"; HAS_ICON=1; break; fi
+          done
+          if [ "$HAS_ICON" = 1 ]; then
+            S=$(identify -format '%[fx:min(w,h)]' "$CAPA[0]")
+            for d in mdpi:48 hdpi:72 xhdpi:96 xxhdpi:144 xxxhdpi:192; do
+              mkdir -p proj/app/src/main/res/mipmap-${d%%:*}
+              convert "$CAPA[0]" -gravity center -crop ${S}x${S}+0+0 +repage -resize ${d##*:}x${d##*:} PNG32:proj/app/src/main/res/mipmap-${d%%:*}/ic_launcher.png
+            done
+            mkdir -p proj/app/src/main/res/drawable-nodpi
+            convert "$CAPA[0]" -gravity center -crop ${S}x${S}+0+0 +repage -resize 512x512 PNG32:proj/app/src/main/res/drawable-nodpi/capa.png
+          fi
+          export HAS_ICON
           cd proj
           cat > settings.gradle <<'EOT'
           pluginManagement {
@@ -58,72 +123,171 @@ jobs:
           cat > build.gradle <<'EOT'
           plugins { id 'com.android.application' version '8.5.2' apply false }
           EOT
-          printf 'org.gradle.jvmargs=-Xmx2g\n' > gradle.properties
-          cat > app/build.gradle <<'EOT'
-          plugins { id 'com.android.application' }
-          android {
-              namespace 'com.taru.jogo'
-              compileSdk 34
-              defaultConfig {
-                  applicationId "__PKG__"
-                  minSdk 21
-                  targetSdk 34
-                  versionCode 1
-                  versionName "1.0"
-              }
-              compileOptions {
-                  sourceCompatibility JavaVersion.VERSION_17
-                  targetCompatibility JavaVersion.VERSION_17
-              }
-          }
+          printf 'org.gradle.jvmargs=-Xmx2g\nandroid.useAndroidX=true\n' > gradle.properties
+          cat > app/src/main/assets/hook.js <<'EOT'
+          (function(){
+            if(window.__hookOk)return;window.__hookOk=true;
+            function toData(url,cb){var x=new XMLHttpRequest();x.open('GET',url,true);x.responseType='blob';
+              x.onload=function(){var r=new FileReader();r.onloadend=function(){cb(r.result);};r.readAsDataURL(x.response);};x.send();}
+            function save(url,name){toData(url,function(d){AndroidBridge.saveBase64(d,name||'arquivo');});}
+            var oc=HTMLAnchorElement.prototype.click;
+            HTMLAnchorElement.prototype.click=function(){
+              if(this.hasAttribute('download')&&/^(blob:|data:)/.test(this.href)){save(this.href,this.getAttribute('download'));return;}
+              return oc.apply(this,arguments);};
+            document.addEventListener('click',function(e){
+              var a=e.target&&e.target.closest?e.target.closest('a[download]'):null;
+              if(a&&/^(blob:|data:)/.test(a.href)){e.preventDefault();save(a.href,a.getAttribute('download'));}
+            },true);
+          })();
           EOT
-          cat > app/src/main/AndroidManifest.xml <<'EOT'
-          <?xml version="1.0" encoding="utf-8"?>
-          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
-              <application
-                  android:label="__NAME__"
-                  android:theme="@android:style/Theme.NoTitleBar.Fullscreen"
-                  android:hardwareAccelerated="true">
-                  <activity
-                      android:name=".MainActivity"
-                      android:exported="true"
-                      android:screenOrientation="__ORI__"
-                      android:configChanges="orientation|screenSize|keyboardHidden">
-                      <intent-filter>
-                          <action android:name="android.intent.action.MAIN"/>
-                          <category android:name="android.intent.category.LAUNCHER"/>
-                      </intent-filter>
-                  </activity>
-              </application>
-          </manifest>
-          EOT
-          sed -i "s|__PKG__|$APP_PACKAGE|; s|__NAME__|$APP_NAME|; s|__ORI__|$ORI|" app/build.gradle app/src/main/AndroidManifest.xml
           cat > app/src/main/java/com/taru/jogo/MainActivity.java <<'EOT'
           package com.taru.jogo;
 
+          import android.Manifest;
           import android.app.Activity;
+          import android.content.ContentValues;
+          import android.content.Intent;
+          import android.content.pm.PackageManager;
+          import android.graphics.Color;
+          import android.net.Uri;
+          import android.os.Build;
           import android.os.Bundle;
+          import android.os.Environment;
+          import android.provider.MediaStore;
+          import android.util.Base64;
           import android.view.View;
+          import android.view.WindowManager;
+          import android.webkit.JavascriptInterface;
+          import android.webkit.PermissionRequest;
+          import android.webkit.URLUtil;
+          import android.webkit.ValueCallback;
+          import android.webkit.WebChromeClient;
+          import android.webkit.WebResourceRequest;
+          import android.webkit.WebResourceResponse;
           import android.webkit.WebSettings;
           import android.webkit.WebView;
           import android.webkit.WebViewClient;
+          import android.widget.FrameLayout;
+          import android.widget.ImageView;
+          import android.widget.Toast;
+          import androidx.webkit.WebViewAssetLoader;
+          import java.io.ByteArrayOutputStream;
+          import java.io.File;
+          import java.io.FileOutputStream;
+          import java.io.InputStream;
+          import java.io.OutputStream;
+          import java.util.ArrayList;
+          import java.util.List;
 
           public class MainActivity extends Activity {
+              private static final int REQ_FILE = 11, REQ_PERM = 12;
+              private static final String HOST = "appassets.androidplatform.net";
               private WebView web;
+              private FrameLayout root;
+              private ImageView splash;
+              private ValueCallback<Uri[]> fileCb;
+              private PermissionRequest pendingPerm;
+              private long backAt = 0, startAt;
+              private String hookJs = "";
 
-              @Override
-              protected void onCreate(Bundle b) {
+              @Override protected void onCreate(Bundle b) {
                   super.onCreate(b);
+                  startAt = System.currentTimeMillis();
+                  getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+                  try {
+                      InputStream in = getAssets().open("hook.js");
+                      ByteArrayOutputStream bo = new ByteArrayOutputStream();
+                      byte[] buf = new byte[4096]; int n;
+                      while ((n = in.read(buf)) > 0) bo.write(buf, 0, n);
+                      in.close();
+                      hookJs = bo.toString("UTF-8");
+                  } catch (Exception e) { }
+                  root = new FrameLayout(this);
+                  root.setBackgroundColor(Color.BLACK);
                   web = new WebView(this);
-                  setContentView(web);
+                  web.setBackgroundColor(Color.BLACK);
+                  root.addView(web, new FrameLayout.LayoutParams(-1, -1));
+                  setContentView(root);
+
                   WebSettings s = web.getSettings();
                   s.setJavaScriptEnabled(true);
                   s.setDomStorageEnabled(true);
                   s.setMediaPlaybackRequiresUserGesture(false);
-                  s.setAllowFileAccess(true);
-                  web.setWebViewClient(new WebViewClient());
-                  web.loadUrl("file:///android_asset/index.html");
+                  s.setSupportZoom(false);
+                  s.setBuiltInZoomControls(false);
+                  web.setLongClickable(false);
+                  web.setOnLongClickListener(v -> true);
+                  web.setHapticFeedbackEnabled(false);
+                  web.addJavascriptInterface(new Bridge(), "AndroidBridge");
+
+                  final WebViewAssetLoader loader = new WebViewAssetLoader.Builder()
+                      .addPathHandler("/assets/", new WebViewAssetLoader.AssetsPathHandler(this)).build();
+                  web.setWebViewClient(new WebViewClient() {
+                      @Override public WebResourceResponse shouldInterceptRequest(WebView v, WebResourceRequest r) {
+                          return loader.shouldInterceptRequest(r.getUrl());
+                      }
+                      @Override public boolean shouldOverrideUrlLoading(WebView v, WebResourceRequest r) {
+                          Uri u = r.getUrl();
+                          if (HOST.equals(u.getHost())) return false;
+                          try { startActivity(new Intent(Intent.ACTION_VIEW, u)); } catch (Exception e) { }
+                          return true;
+                      }
+                      @Override public void onPageFinished(WebView v, String url) {
+                          v.evaluateJavascript(hookJs, null);
+                          hideSplash();
+                      }
+                  });
+                  web.setWebChromeClient(new WebChromeClient() {
+                      @Override public void onPermissionRequest(final PermissionRequest req) {
+                          runOnUiThread(() -> {
+                              List<String> missing = new ArrayList<>();
+                              for (String r : req.getResources()) {
+                                  String p = PermissionRequest.RESOURCE_AUDIO_CAPTURE.equals(r) ? Manifest.permission.RECORD_AUDIO
+                                      : PermissionRequest.RESOURCE_VIDEO_CAPTURE.equals(r) ? Manifest.permission.CAMERA : null;
+                                  if (p != null && checkSelfPermission(p) != PackageManager.PERMISSION_GRANTED) missing.add(p);
+                              }
+                              if (missing.isEmpty()) { req.grant(req.getResources()); }
+                              else { pendingPerm = req; requestPermissions(missing.toArray(new String[0]), REQ_PERM); }
+                          });
+                      }
+                      @Override public boolean onShowFileChooser(WebView w, ValueCallback<Uri[]> cb, FileChooserParams p) {
+                          if (fileCb != null) fileCb.onReceiveValue(null);
+                          fileCb = cb;
+                          try { startActivityForResult(p.createIntent(), REQ_FILE); }
+                          catch (Exception e) { fileCb = null; return false; }
+                          return true;
+                      }
+                  });
+                  web.setDownloadListener((url, ua, cd, mime, len) -> {
+                      if (url.startsWith("blob:") || url.startsWith("data:")) {
+                          String fn = URLUtil.guessFileName(url, cd, mime).replace("'", "").replace("\\", "");
+                          web.evaluateJavascript("(function(){var x=new XMLHttpRequest();x.open('GET','" + url
+                              + "',true);x.responseType='blob';x.onload=function(){var r=new FileReader();r.onloadend=function(){AndroidBridge.saveBase64(r.result,'"
+                              + fn + "');};r.readAsDataURL(x.response);};x.send();})()", null);
+                      } else {
+                          try { startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(url))); } catch (Exception e) { }
+                      }
+                  });
+
+                  int id = getResources().getIdentifier("capa", "drawable", getPackageName());
+                  if (id != 0) {
+                      splash = new ImageView(this);
+                      splash.setBackgroundColor(Color.BLACK);
+                      splash.setScaleType(ImageView.ScaleType.CENTER_INSIDE);
+                      splash.setImageResource(id);
+                      root.addView(splash, new FrameLayout.LayoutParams(-1, -1));
+                  }
+                  web.addJavascriptInterface(new AdsBridge(this, web, root), "Ads");
                   hideBars();
+                  web.loadUrl("https://" + HOST + "/assets/index.html");
+              }
+
+              private void hideSplash() {
+                  if (splash == null) return;
+                  final ImageView sp = splash;
+                  splash = null;
+                  long wait = Math.max(0, 1200 - (System.currentTimeMillis() - startAt));
+                  sp.postDelayed(() -> sp.animate().alpha(0f).setDuration(400).withEndAction(() -> root.removeView(sp)).start(), wait);
               }
 
               private void hideBars() {
@@ -132,16 +296,315 @@ jobs:
                       | View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY | View.SYSTEM_UI_FLAG_LAYOUT_STABLE);
               }
 
+              private void saveFile(byte[] data, String name, String mime) throws Exception {
+                  if (name == null || name.trim().isEmpty()) name = "arquivo";
+                  name = name.replaceAll("[\\\\/:*?\"<>|]", "_");
+                  String where;
+                  if (Build.VERSION.SDK_INT >= 29) {
+                      ContentValues v = new ContentValues();
+                      v.put(MediaStore.MediaColumns.DISPLAY_NAME, name);
+                      v.put(MediaStore.MediaColumns.MIME_TYPE, mime);
+                      v.put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS);
+                      Uri uri = getContentResolver().insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, v);
+                      if (uri == null) throw new Exception("sem acesso a Downloads");
+                      OutputStream o = getContentResolver().openOutputStream(uri);
+                      o.write(data);
+                      o.close();
+                      where = "Downloads";
+                  } else {
+                      File f = new File(getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS), name);
+                      FileOutputStream o = new FileOutputStream(f);
+                      o.write(data);
+                      o.close();
+                      where = f.getParent();
+                  }
+                  final String msg = "Salvo em " + where + ": " + name;
+                  runOnUiThread(() -> Toast.makeText(MainActivity.this, msg, Toast.LENGTH_LONG).show());
+              }
+
+              private class Bridge {
+                  @JavascriptInterface public void saveBase64(String dataUrl, String name) {
+                      try {
+                          int c = dataUrl.indexOf(',');
+                          String meta = dataUrl.substring(0, c);
+                          byte[] bytes = Base64.decode(dataUrl.substring(c + 1), Base64.DEFAULT);
+                          String mime = "application/octet-stream";
+                          if (meta.startsWith("data:")) {
+                              int e = meta.indexOf(';');
+                              String m = meta.substring(5, e > 0 ? e : meta.length());
+                              if (!m.isEmpty()) mime = m;
+                          }
+                          saveFile(bytes, name, mime);
+                      } catch (final Exception ex) {
+                          runOnUiThread(() -> Toast.makeText(MainActivity.this, "Erro ao salvar: " + ex.getMessage(), Toast.LENGTH_LONG).show());
+                      }
+                  }
+              }
+
+              @Override protected void onActivityResult(int req, int res, Intent data) {
+                  if (req == REQ_FILE && fileCb != null) {
+                      fileCb.onReceiveValue(WebChromeClient.FileChooserParams.parseResult(res, data));
+                      fileCb = null;
+                  }
+                  super.onActivityResult(req, res, data);
+              }
+
+              @Override public void onRequestPermissionsResult(int code, String[] perms, int[] res) {
+                  super.onRequestPermissionsResult(code, perms, res);
+                  if (code == REQ_PERM && pendingPerm != null) {
+                      boolean ok = res.length > 0;
+                      for (int r : res) if (r != PackageManager.PERMISSION_GRANTED) ok = false;
+                      if (ok) pendingPerm.grant(pendingPerm.getResources()); else pendingPerm.deny();
+                      pendingPerm = null;
+                  }
+              }
+
+              @Override public void onBackPressed() {
+                  web.evaluateJavascript("(function(){try{return !!(window.onBackButton&&window.onBackButton());}catch(e){return false;}})()", v -> {
+                      if ("true".equals(v)) return;
+                      long now = System.currentTimeMillis();
+                      if (now - backAt < 2000) { finish(); }
+                      else { backAt = now; Toast.makeText(MainActivity.this, "Toque novamente para sair", Toast.LENGTH_SHORT).show(); }
+                  });
+              }
+
               @Override public void onWindowFocusChanged(boolean f) { super.onWindowFocusChanged(f); if (f) hideBars(); }
-              @Override public void onBackPressed() { if (web.canGoBack()) web.goBack(); else super.onBackPressed(); }
-              @Override protected void onPause() { super.onPause(); web.onPause(); }
-              @Override protected void onResume() { super.onResume(); web.onResume(); }
+              @Override protected void onPause() { super.onPause(); web.onPause(); web.pauseTimers(); }
+              @Override protected void onResume() { super.onResume(); web.onResume(); web.resumeTimers(); }
+              @Override protected void onDestroy() { super.onDestroy(); web.destroy(); }
           }
           EOT
+          python3 - <<'PYGEN'
+          import os, re
+          E = os.environ
+          name = re.sub(r'[^\w .\-]', '', E.get('APP_NAME', ''), flags=re.U).strip() or 'Jogo'
+          pkg = E['APP_PACKAGE'].strip()
+          ver = re.sub(r'[^0-9A-Za-z._-]', '', E.get('VERSION_NAME', '1.0')) or '1.0'
+          ori = E['ORI']
+          perm = E.get('PERMS', 'nenhuma')
+          app = E.get('ADMOB_APP', '').strip()
+          ban = E.get('ADMOB_BANNER', '').strip()
+          inter = E.get('ADMOB_INTER', '').strip()
+          rew = E.get('ADMOB_REWARD', '').strip()
+          def die(m):
+              print('ERRO: ' + m)
+              raise SystemExit(1)
+          if not re.match(r'^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)+$', pkg):
+              die('ID invalido. Use minusculas e pontos, sem numero no comeco de cada parte. Ex: com.taru.jogo1')
+          if app and not re.match(r'^ca-app-pub-[0-9]{16}~[0-9]{10}$', app):
+              die('ID do app AdMob invalido (formato ca-app-pub-0000000000000000~0000000000)')
+          for u in (ban, inter, rew):
+              if u and not re.match(r'^ca-app-pub-[0-9]{16}/[0-9]{10}$', u):
+                  die('ID de bloco AdMob invalido (formato ca-app-pub-0000000000000000/0000000000)')
+          ads = bool(app)
+          net = perm.startswith('internet') or ads
+          mic = 'microfone' in perm
+          cam = 'camera' in perm
+          icon = E.get('HAS_ICON') == '1'
+          P = []
+          if net:
+              P.append('<uses-permission android:name="android.permission.INTERNET"/>')
+              P.append('<uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>')
+          if mic:
+              P.append('<uses-permission android:name="android.permission.RECORD_AUDIO"/>')
+              P.append('<uses-feature android:name="android.hardware.microphone" android:required="false"/>')
+          if cam:
+              P.append('<uses-permission android:name="android.permission.CAMERA"/>')
+              P.append('<uses-feature android:name="android.hardware.camera" android:required="false"/>')
+          meta = ('<meta-data android:name="com.google.android.gms.ads.APPLICATION_ID" android:value="%s"/>' % app) if ads else ''
+          manifest = '''<?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              %s
+              <application
+                  android:label="%s"
+                  %s
+                  android:allowBackup="false"
+                  android:theme="@android:style/Theme.NoTitleBar.Fullscreen"
+                  android:hardwareAccelerated="true">
+                  %s
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:screenOrientation="%s"
+                      android:configChanges="orientation|screenSize|keyboardHidden|screenLayout|smallestScreenSize|uiMode">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN"/>
+                          <category android:name="android.intent.category.LAUNCHER"/>
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          ''' % ('\n    '.join(P), name, 'android:icon="@mipmap/ic_launcher"' if icon else '', meta, ori)
+          open('app/src/main/AndroidManifest.xml', 'w', encoding='utf-8').write(manifest)
+          dep = "    implementation 'com.google.android.gms:play-services-ads:23.3.0'\n" if ads else ''
+          gradle = '''plugins { id 'com.android.application' }
+          android {
+              namespace 'com.taru.jogo'
+              compileSdk 34
+              defaultConfig {
+                  applicationId "%s"
+                  minSdk 23
+                  targetSdk 34
+                  versionCode %s
+                  versionName "%s"
+              }
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+              signingConfigs {
+                  rel {
+                      storeFile file('../keystore.jks')
+                      storePassword 'senha123'
+                      keyAlias 'key'
+                      keyPassword 'senha123'
+                  }
+              }
+              buildTypes {
+                  release {
+                      signingConfig signingConfigs.rel
+                      minifyEnabled false
+                  }
+              }
+              lint {
+                  abortOnError false
+                  checkReleaseBuilds false
+              }
+          }
+          dependencies {
+              implementation 'androidx.webkit:webkit:1.11.0'
+          %s}
+          ''' % (pkg, E.get('RUN_NUMBER', '1'), ver, dep)
+          open('app/build.gradle', 'w', encoding='utf-8').write(gradle)
+          STUB = '''package com.taru.jogo;
+          import android.app.Activity;
+          import android.webkit.JavascriptInterface;
+          import android.webkit.WebView;
+          import android.widget.FrameLayout;
+          public class AdsBridge {
+              private final WebView web;
+              public AdsBridge(Activity a, WebView w, FrameLayout r) { web = w; }
+              private void js(final String c) { web.post(() -> web.evaluateJavascript(c, null)); }
+              @JavascriptInterface public void showBanner() { }
+              @JavascriptInterface public void hideBanner() { }
+              @JavascriptInterface public void showInterstitial() { js("window.onAdClosed&&window.onAdClosed('interstitial',false)"); }
+              @JavascriptInterface public void showRewarded() { js("window.onRewarded&&window.onRewarded(false)"); }
+          }
+          '''
+          REAL = '''package com.taru.jogo;
+          import android.app.Activity;
+          import android.view.Gravity;
+          import android.view.View;
+          import android.webkit.JavascriptInterface;
+          import android.webkit.WebView;
+          import android.widget.FrameLayout;
+          import com.google.android.gms.ads.AdError;
+          import com.google.android.gms.ads.AdRequest;
+          import com.google.android.gms.ads.AdSize;
+          import com.google.android.gms.ads.AdView;
+          import com.google.android.gms.ads.FullScreenContentCallback;
+          import com.google.android.gms.ads.LoadAdError;
+          import com.google.android.gms.ads.MobileAds;
+          import com.google.android.gms.ads.interstitial.InterstitialAd;
+          import com.google.android.gms.ads.interstitial.InterstitialAdLoadCallback;
+          import com.google.android.gms.ads.rewarded.RewardedAd;
+          import com.google.android.gms.ads.rewarded.RewardedAdLoadCallback;
+          public class AdsBridge {
+              private static final String BANNER = "__BAN__", INTER = "__INT__", REWARD = "__REW__";
+              private final Activity act;
+              private final WebView web;
+              private final FrameLayout root;
+              private AdView banner;
+              private InterstitialAd inter;
+              private RewardedAd reward;
+              public AdsBridge(Activity a, WebView w, FrameLayout r) {
+                  act = a; web = w; root = r;
+                  MobileAds.initialize(a, status -> act.runOnUiThread(() -> { loadInter(); loadReward(); showBanner(); }));
+              }
+              private void js(final String c) { web.post(() -> web.evaluateJavascript(c, null)); }
+              private void loadInter() {
+                  if (INTER.isEmpty()) return;
+                  InterstitialAd.load(act, INTER, new AdRequest.Builder().build(), new InterstitialAdLoadCallback() {
+                      @Override public void onAdLoaded(InterstitialAd ad) { inter = ad; }
+                      @Override public void onAdFailedToLoad(LoadAdError e) { inter = null; }
+                  });
+              }
+              private void loadReward() {
+                  if (REWARD.isEmpty()) return;
+                  RewardedAd.load(act, REWARD, new AdRequest.Builder().build(), new RewardedAdLoadCallback() {
+                      @Override public void onAdLoaded(RewardedAd ad) { reward = ad; }
+                      @Override public void onAdFailedToLoad(LoadAdError e) { reward = null; }
+                  });
+              }
+              @JavascriptInterface public void showBanner() {
+                  act.runOnUiThread(() -> {
+                      if (BANNER.isEmpty()) return;
+                      if (banner == null) {
+                          banner = new AdView(act);
+                          banner.setAdUnitId(BANNER);
+                          banner.setAdSize(AdSize.BANNER);
+                          root.addView(banner, new FrameLayout.LayoutParams(-2, -2, Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL));
+                          banner.loadAd(new AdRequest.Builder().build());
+                      }
+                      banner.setVisibility(View.VISIBLE);
+                  });
+              }
+              @JavascriptInterface public void hideBanner() {
+                  act.runOnUiThread(() -> { if (banner != null) banner.setVisibility(View.GONE); });
+              }
+              @JavascriptInterface public void showInterstitial() {
+                  act.runOnUiThread(() -> {
+                      if (inter == null) { loadInter(); js("window.onAdClosed&&window.onAdClosed('interstitial',false)"); return; }
+                      inter.setFullScreenContentCallback(new FullScreenContentCallback() {
+                          @Override public void onAdDismissedFullScreenContent() { inter = null; loadInter(); js("window.onAdClosed&&window.onAdClosed('interstitial',true)"); }
+                          @Override public void onAdFailedToShowFullScreenContent(AdError e) { inter = null; loadInter(); js("window.onAdClosed&&window.onAdClosed('interstitial',false)"); }
+                      });
+                      inter.show(act);
+                  });
+              }
+              @JavascriptInterface public void showRewarded() {
+                  act.runOnUiThread(() -> {
+                      if (reward == null) { loadReward(); js("window.onRewarded&&window.onRewarded(false)"); return; }
+                      final boolean[] earned = { false };
+                      reward.setFullScreenContentCallback(new FullScreenContentCallback() {
+                          @Override public void onAdDismissedFullScreenContent() { reward = null; loadReward(); js("window.onRewarded&&window.onRewarded(" + earned[0] + ")"); }
+                          @Override public void onAdFailedToShowFullScreenContent(AdError e) { reward = null; loadReward(); js("window.onRewarded&&window.onRewarded(false)"); }
+                      });
+                      reward.show(act, item -> earned[0] = true);
+                  });
+              }
+          }
+          '''
+          src = REAL.replace('__BAN__', ban).replace('__INT__', inter).replace('__REW__', rew) if ads else STUB
+          open('app/src/main/java/com/taru/jogo/AdsBridge.java', 'w', encoding='utf-8').write(src)
+          print('Projeto montado:', name, pkg, 'icone' if icon else 'sem icone', 'AdMob' if ads else 'sem AdMob')
+          PYGEN
+      - name: Ofuscar codigo
+        if: ${{ inputs.protect }}
+        run: |
+          npm install --no-save --prefix "$RUNNER_TEMP/obf" javascript-obfuscator@4.1.1
+          cat > "$RUNNER_TEMP/obf.js" <<'EOT'
+          const fs = require('fs');
+          const JO = require(process.env.RUNNER_TEMP + '/obf/node_modules/javascript-obfuscator');
+          const file = 'proj/app/src/main/assets/index.html';
+          let html = fs.readFileSync(file, 'utf8');
+          let ok = 0, fail = 0;
+          html = html.replace(/<script(?![^>]*\bsrc\s*=)([^>]*)>([\s\S]*?)<\/script>/gi, (m, attrs, code) => {
+            if (!code.trim() || /type\s*=\s*["'](?!text\/javascript)/i.test(attrs)) return m;
+            try {
+              const r = JO.obfuscate(code, { compact: true, target: 'browser', renameGlobals: false, stringArray: true, stringArrayThreshold: 0.75, identifierNamesGenerator: 'hexadecimal', controlFlowFlattening: false, deadCodeInjection: false, selfDefending: false, debugProtection: false, disableConsoleOutput: false });
+              ok++;
+              return '<script' + attrs + '>' + r.getObfuscatedCode() + '</script>';
+            } catch (e) { fail++; console.log('aviso: um script nao foi ofuscado: ' + e.message); return m; }
+          });
+          fs.writeFileSync(file, html);
+          console.log('scripts ofuscados:', ok, 'falhas:', fail);
+          EOT
+          node "$RUNNER_TEMP/obf.js"
       - name: Compilar APK
         working-directory: proj
-        run: gradle assembleDebug --no-daemon
+        run: gradle assembleRelease --no-daemon
       - uses: actions/upload-artifact@v4
         with:
           name: jogo-apk
-          path: proj/app/build/outputs/apk/debug/*.apk
+          path: proj/app/build/outputs/apk/release/*.apk
