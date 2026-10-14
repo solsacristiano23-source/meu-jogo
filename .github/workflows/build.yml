@@ -1,4 +1,4 @@
-# motor v3
+# motor v5
 name: Build APK
 on:
   workflow_dispatch:
@@ -95,13 +95,29 @@ jobs:
             if [ -f "$f" ]; then CAPA="$f"; HAS_ICON=1; break; fi
           done
           if [ "$HAS_ICON" = 1 ]; then
-            S=$(identify -format '%[fx:min(w,h)]' "$CAPA[0]")
-            for d in mdpi:48 hdpi:72 xhdpi:96 xxhdpi:144 xxxhdpi:192; do
-              mkdir -p proj/app/src/main/res/mipmap-${d%%:*}
-              convert "$CAPA[0]" -gravity center -crop ${S}x${S}+0+0 +repage -resize ${d##*:}x${d##*:} PNG32:proj/app/src/main/res/mipmap-${d%%:*}/ic_launcher.png
-            done
-            mkdir -p proj/app/src/main/res/drawable-nodpi
-            convert "$CAPA[0]" -gravity center -crop ${S}x${S}+0+0 +repage -resize 512x512 PNG32:proj/app/src/main/res/drawable-nodpi/capa.png
+            python3 -c "import PIL" 2>/dev/null || python3 -m pip install --quiet --break-system-packages pillow || python3 -m pip install --quiet pillow
+            if ! CAPA="$CAPA" python3 - <<'PYICON'
+          import os
+          from PIL import Image
+          im = Image.open(os.environ['CAPA'])
+          im.seek(0)
+          im = im.convert('RGBA')
+          w, h = im.size
+          s = min(w, h)
+          l, t = (w - s) // 2, (h - s) // 2
+          sq = im.crop((l, t, l + s, t + s))
+          base = 'proj/app/src/main/res/'
+          for d, px in (('mdpi', 48), ('hdpi', 72), ('xhdpi', 96), ('xxhdpi', 144), ('xxxhdpi', 192)):
+              os.makedirs(base + 'mipmap-' + d, exist_ok=True)
+              sq.resize((px, px), Image.LANCZOS).save(base + 'mipmap-' + d + '/ic_launcher.png')
+          os.makedirs(base + 'drawable-nodpi', exist_ok=True)
+          sq.resize((512, 512), Image.LANCZOS).save(base + 'drawable-nodpi/capa.png')
+          PYICON
+            then
+              echo "AVISO: nao consegui gerar o icone; seguindo sem capa"
+              rm -rf proj/app/src/main/res
+              HAS_ICON=0
+            fi
           fi
           export HAS_ICON
           cd proj
@@ -149,6 +165,7 @@ jobs:
           import android.os.Bundle;
           import android.os.Environment;
           import android.provider.MediaStore;
+          import android.provider.Settings;
           import android.util.Base64;
           import android.view.View;
           import android.view.WindowManager;
@@ -177,6 +194,7 @@ jobs:
 
           public class MainActivity extends Activity {
               static MainActivity current;
+              static String pendingFloat;
               private static final int REQ_FILE = 11, REQ_PERM = 12, REQ_JS = 13, REQ_GEO = 14;
               private static final String HOST = "appassets.androidplatform.net";
               private WebView web;
@@ -189,6 +207,10 @@ jobs:
               private long backAt = 0, startAt;
               private String hookJs = "";
               boolean keepRunning = false;
+
+              static int overlayType() {
+                  return Build.VERSION.SDK_INT >= 26 ? WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY : WindowManager.LayoutParams.TYPE_PHONE;
+              }
 
               static void callJs(final String code) {
                   final MainActivity m = current;
@@ -425,7 +447,15 @@ jobs:
 
               @Override public void onWindowFocusChanged(boolean f) { super.onWindowFocusChanged(f); if (f) hideBars(); }
               @Override protected void onPause() { super.onPause(); if (!keepRunning) { web.onPause(); web.pauseTimers(); } }
-              @Override protected void onResume() { super.onResume(); web.onResume(); web.resumeTimers(); }
+              @Override protected void onResume() {
+                  super.onResume();
+                  web.onResume();
+                  web.resumeTimers();
+                  if (pendingFloat != null && Settings.canDrawOverlays(this)) {
+                      FloatUi.show(getApplicationContext(), overlayType(), pendingFloat);
+                      pendingFloat = null;
+                  }
+              }
               @Override protected void onDestroy() { if (current == this) current = null; super.onDestroy(); web.destroy(); }
           }
           EOT
@@ -439,6 +469,15 @@ jobs:
           import android.content.Intent;
           import android.content.IntentFilter;
           import android.content.pm.PackageInfo;
+          import android.content.pm.PackageManager;
+          import android.content.pm.ResolveInfo;
+          import android.graphics.Bitmap;
+          import android.graphics.Canvas;
+          import android.graphics.drawable.Drawable;
+          import android.util.Base64;
+          import java.io.ByteArrayOutputStream;
+          import java.util.List;
+          import org.json.JSONArray;
           import android.net.ConnectivityManager;
           import android.net.Network;
           import android.net.NetworkCapabilities;
@@ -491,6 +530,7 @@ jobs:
                           o.put("versaoApp", pi.versionName);
                       } catch (Exception e) { }
                       o.put("acessibilidadeAtiva", AutoService.instance != null);
+                      o.put("sobreporPermitido", Settings.canDrawOverlays(a));
                       return o.toString();
                   } catch (Exception e) { return "{}"; }
               }
@@ -545,7 +585,78 @@ jobs:
               @JavascriptInterface public void manterAtivo(boolean on) { a.keepRunning = on; }
               @JavascriptInterface public void manterTelaLigada(boolean on) { a.setKeepScreenOn(on); }
 
-              /* ---- sobre outros apps e toques automaticos (precisa do servico de acessibilidade ligado) ---- */
+              /* ---- apps instalados (so os que aparecem na tela inicial) ---- */
+              @JavascriptInterface public String apps() {
+                  try {
+                      PackageManager pm = a.getPackageManager();
+                      Intent i = new Intent(Intent.ACTION_MAIN);
+                      i.addCategory(Intent.CATEGORY_LAUNCHER);
+                      List<ResolveInfo> l = pm.queryIntentActivities(i, 0);
+                      JSONArray arr = new JSONArray();
+                      for (ResolveInfo r : l) {
+                          JSONObject o = new JSONObject();
+                          o.put("nome", r.loadLabel(pm).toString());
+                          o.put("pacote", r.activityInfo.packageName);
+                          arr.put(o);
+                      }
+                      return arr.toString();
+                  } catch (Exception e) { return "[]"; }
+              }
+              @JavascriptInterface public String iconeApp(String pacote) {
+                  try {
+                      Drawable d = a.getPackageManager().getApplicationIcon(pacote);
+                      Bitmap b = Bitmap.createBitmap(96, 96, Bitmap.Config.ARGB_8888);
+                      Canvas c = new Canvas(b);
+                      d.setBounds(0, 0, 96, 96);
+                      d.draw(c);
+                      ByteArrayOutputStream bo = new ByteArrayOutputStream();
+                      b.compress(Bitmap.CompressFormat.PNG, 100, bo);
+                      return "data:image/png;base64," + Base64.encodeToString(bo.toByteArray(), Base64.NO_WRAP);
+                  } catch (Exception e) { return ""; }
+              }
+              @JavascriptInterface public boolean abrirApp(final String pacote) {
+                  Intent i = a.getPackageManager().getLaunchIntentForPackage(pacote);
+                  if (i == null) return false;
+                  i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                  final Intent go = i;
+                  a.runOnUiThread(() -> { try { a.startActivity(go); } catch (Exception e) { } });
+                  return true;
+              }
+
+              /* ---- sobre outros apps e toques automaticos ---- */
+              private long lastGuide = 0;
+
+              private boolean flutuanteIncluido() {
+                  try {
+                      PackageInfo pi = a.getPackageManager().getPackageInfo(a.getPackageName(), PackageManager.GET_PERMISSIONS);
+                      if (pi.requestedPermissions != null)
+                          for (String p : pi.requestedPermissions) if ("android.permission.SYSTEM_ALERT_WINDOW".equals(p)) return true;
+                  } catch (Exception e) { }
+                  return false;
+              }
+
+              private void abrirSobreposicao() {
+                  a.runOnUiThread(() -> {
+                      try {
+                          Intent i = new Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:" + a.getPackageName()));
+                          i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                          a.startActivity(i);
+                      } catch (Exception e) { }
+                  });
+              }
+
+              /* Quando o servico de acessibilidade esta desligado: avisa e abre a tela certa (no maximo a cada 6 s). */
+              private void guiaAcessibilidade() {
+                  long now = System.currentTimeMillis();
+                  if (now - lastGuide < 6000) return;
+                  lastGuide = now;
+                  if (!flutuanteIncluido()) { toast("Este APK foi gerado sem a opcao Flutuante + clique. Ligue no painel e gere de novo."); return; }
+                  toast("Ative este app em Configuracoes > Acessibilidade para usar os toques automaticos.");
+                  abrirAcessibilidade();
+              }
+
+              @JavascriptInterface public boolean sobreporPermitido() { return Settings.canDrawOverlays(a); }
+              @JavascriptInterface public void pedirSobreposicao() { abrirSobreposicao(); }
               @JavascriptInterface public boolean acessibilidadeAtiva() { return AutoService.instance != null; }
               @JavascriptInterface public void abrirAcessibilidade() {
                   a.runOnUiThread(() -> {
@@ -556,19 +667,19 @@ jobs:
               }
               @JavascriptInterface public boolean tocar(float x, float y) {
                   AutoService s = AutoService.instance;
-                  if (s == null) return false;
+                  if (s == null) { guiaAcessibilidade(); return false; }
                   s.tap(x, y);
                   return true;
               }
               @JavascriptInterface public boolean deslizar(float x1, float y1, float x2, float y2, int ms) {
                   AutoService s = AutoService.instance;
-                  if (s == null) return false;
+                  if (s == null) { guiaAcessibilidade(); return false; }
                   s.swipe(x1, y1, x2, y2, ms);
                   return true;
               }
               @JavascriptInterface public boolean tocarRepetido(float x, float y, int ms) {
                   AutoService s = AutoService.instance;
-                  if (s == null) return false;
+                  if (s == null) { guiaAcessibilidade(); return false; }
                   s.startLoop(x, y, ms);
                   return true;
               }
@@ -576,15 +687,28 @@ jobs:
                   AutoService s = AutoService.instance;
                   if (s != null) s.stopLoop();
               }
+
+              /* Mostra o botao flutuante. Se faltar permissao, abre a tela certa e mostra sozinho quando voce voltar. */
               @JavascriptInterface public boolean mostrarFlutuante(String texto) {
+                  final String label = texto == null ? "\u25CF" : texto;
                   AutoService s = AutoService.instance;
-                  if (s == null) return false;
-                  s.showFloat(texto == null ? "●" : texto);
-                  return true;
+                  if (s != null) { s.showFloat(label); return true; }
+                  if (!flutuanteIncluido()) {
+                      toast("Este APK foi gerado sem a opcao Flutuante + clique. Ligue no painel e gere de novo.");
+                      return false;
+                  }
+                  if (Settings.canDrawOverlays(a)) {
+                      FloatUi.show(a.getApplicationContext(), MainActivity.overlayType(), label);
+                      return true;
+                  }
+                  MainActivity.pendingFloat = label;
+                  toast("Permita \"Exibir sobre outros apps\" para este app e volte.");
+                  abrirSobreposicao();
+                  return false;
               }
               @JavascriptInterface public void esconderFlutuante() {
-                  AutoService s = AutoService.instance;
-                  if (s != null) s.hideFloat();
+                  MainActivity.pendingFloat = null;
+                  FloatUi.hide();
               }
           }
           EOT
@@ -593,19 +717,12 @@ jobs:
 
           import android.accessibilityservice.AccessibilityService;
           import android.accessibilityservice.GestureDescription;
-          import android.graphics.Color;
           import android.graphics.Path;
-          import android.graphics.PixelFormat;
-          import android.graphics.drawable.GradientDrawable;
           import android.os.Build;
           import android.os.Handler;
           import android.os.Looper;
-          import android.view.Gravity;
-          import android.view.MotionEvent;
-          import android.view.View;
           import android.view.WindowManager;
           import android.view.accessibility.AccessibilityEvent;
-          import android.widget.TextView;
 
           /* Servico de acessibilidade com o minimo de poderes: so faz toques/deslizes e mostra um botao flutuante.
              Nao le a tela de outros apps (canRetrieveWindowContent = false). */
@@ -613,10 +730,12 @@ jobs:
               static AutoService instance;
               private final Handler h = new Handler(Looper.getMainLooper());
               private Runnable loop;
-              private View floatView;
-              private WindowManager wm;
 
-              @Override protected void onServiceConnected() { instance = this; super.onServiceConnected(); }
+              @Override protected void onServiceConnected() {
+                  instance = this;
+                  super.onServiceConnected();
+                  if (MainActivity.pendingFloat != null) { showFloat(MainActivity.pendingFloat); MainActivity.pendingFloat = null; }
+              }
               @Override public void onAccessibilityEvent(AccessibilityEvent e) { }
               @Override public void onInterrupt() { }
               @Override public boolean onUnbind(android.content.Intent i) { stopLoop(); hideFloat(); instance = null; return super.onUnbind(i); }
@@ -646,55 +765,84 @@ jobs:
                   h.post(() -> { if (loop != null) { h.removeCallbacks(loop); loop = null; } });
               }
 
-              void showFloat(final String label) {
+              void showFloat(String label) { FloatUi.show(this, WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY, label); }
+              void hideFloat() { FloatUi.hide(); }
+          }
+          EOT
+          cat > app/src/main/java/com/taru/jogo/FloatUi.java <<'EOT'
+          package com.taru.jogo;
+
+          import android.content.Context;
+          import android.graphics.Color;
+          import android.graphics.PixelFormat;
+          import android.graphics.drawable.GradientDrawable;
+          import android.os.Handler;
+          import android.os.Looper;
+          import android.view.Gravity;
+          import android.view.MotionEvent;
+          import android.view.View;
+          import android.view.WindowManager;
+          import android.widget.TextView;
+
+          /* Botao flutuante arrastavel. Serve para os dois modos: "exibir sobre outros apps" e acessibilidade. */
+          class FloatUi {
+              private static View view;
+              private static WindowManager wm;
+              private static int curType;
+              private static final Handler h = new Handler(Looper.getMainLooper());
+
+              static void show(final Context c, final int type, final String label) {
                   h.post(() -> {
-                      if (floatView != null) { ((TextView) floatView).setText(label); return; }
-                      wm = (WindowManager) getSystemService(WINDOW_SERVICE);
-                      final TextView t = new TextView(this);
-                      t.setText(label);
-                      t.setTextColor(Color.WHITE);
-                      t.setTextSize(14);
-                      t.setGravity(Gravity.CENTER);
-                      t.setPadding(36, 24, 36, 24);
-                      GradientDrawable gd = new GradientDrawable();
-                      gd.setColor(0xDD7C5CFF);
-                      gd.setCornerRadius(80);
-                      t.setBackground(gd);
-                      final WindowManager.LayoutParams lp = new WindowManager.LayoutParams(
-                          WindowManager.LayoutParams.WRAP_CONTENT, WindowManager.LayoutParams.WRAP_CONTENT,
-                          WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
-                          WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE, PixelFormat.TRANSLUCENT);
-                      lp.gravity = Gravity.TOP | Gravity.START;
-                      lp.x = 40;
-                      lp.y = 300;
-                      t.setOnTouchListener(new View.OnTouchListener() {
-                          float sx, sy; int ox, oy; boolean moved;
-                          @Override public boolean onTouch(View v, MotionEvent e) {
-                              switch (e.getAction()) {
-                                  case MotionEvent.ACTION_DOWN: sx = e.getRawX(); sy = e.getRawY(); ox = lp.x; oy = lp.y; moved = false; return true;
-                                  case MotionEvent.ACTION_MOVE:
-                                      if (Math.abs(e.getRawX() - sx) + Math.abs(e.getRawY() - sy) > 12) moved = true;
-                                      lp.x = ox + (int) (e.getRawX() - sx);
-                                      lp.y = oy + (int) (e.getRawY() - sy);
-                                      wm.updateViewLayout(v, lp);
-                                      return true;
-                                  case MotionEvent.ACTION_UP:
-                                      if (!moved) MainActivity.callJs("window.onFlutuanteClick&&window.onFlutuanteClick()");
-                                      return true;
-                                  default: return false;
+                      if (view != null && curType == type) { ((TextView) view).setText(label); return; }
+                      hideNow();
+                      try {
+                          wm = (WindowManager) c.getSystemService(Context.WINDOW_SERVICE);
+                          final TextView t = new TextView(c);
+                          t.setText(label);
+                          t.setTextColor(Color.WHITE);
+                          t.setTextSize(14);
+                          t.setGravity(Gravity.CENTER);
+                          t.setPadding(36, 24, 36, 24);
+                          GradientDrawable gd = new GradientDrawable();
+                          gd.setColor(0xDD7C5CFF);
+                          gd.setCornerRadius(80);
+                          t.setBackground(gd);
+                          final WindowManager.LayoutParams lp = new WindowManager.LayoutParams(
+                              WindowManager.LayoutParams.WRAP_CONTENT, WindowManager.LayoutParams.WRAP_CONTENT,
+                              type, WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE, PixelFormat.TRANSLUCENT);
+                          lp.gravity = Gravity.TOP | Gravity.START;
+                          lp.x = 40;
+                          lp.y = 300;
+                          t.setOnTouchListener(new View.OnTouchListener() {
+                              float sx, sy; int ox, oy; boolean moved;
+                              @Override public boolean onTouch(View v, MotionEvent e) {
+                                  switch (e.getAction()) {
+                                      case MotionEvent.ACTION_DOWN: sx = e.getRawX(); sy = e.getRawY(); ox = lp.x; oy = lp.y; moved = false; return true;
+                                      case MotionEvent.ACTION_MOVE:
+                                          if (Math.abs(e.getRawX() - sx) + Math.abs(e.getRawY() - sy) > 12) moved = true;
+                                          lp.x = ox + (int) (e.getRawX() - sx);
+                                          lp.y = oy + (int) (e.getRawY() - sy);
+                                          wm.updateViewLayout(v, lp);
+                                          return true;
+                                      case MotionEvent.ACTION_UP:
+                                          if (!moved) MainActivity.callJs("window.onFlutuanteClick&&window.onFlutuanteClick()");
+                                          return true;
+                                      default: return false;
+                                  }
                               }
-                          }
-                      });
-                      wm.addView(t, lp);
-                      floatView = t;
+                          });
+                          wm.addView(t, lp);
+                          view = t;
+                          curType = type;
+                      } catch (Exception e) { view = null; }
                   });
               }
 
-              void hideFloat() {
-                  h.post(() -> {
-                      if (floatView != null && wm != null) { try { wm.removeView(floatView); } catch (Exception e) { } }
-                      floatView = null;
-                  });
+              static void hide() { h.post(() -> hideNow()); }
+
+              private static void hideNow() {
+                  if (view != null && wm != null) { try { wm.removeView(view); } catch (Exception e) { } }
+                  view = null;
               }
           }
           EOT
@@ -740,11 +888,14 @@ jobs:
               P.append('<uses-permission android:name="android.permission.CAMERA"/>')
               P.append('<uses-feature android:name="android.hardware.camera" android:required="false"/>')
           P.append('<uses-permission android:name="android.permission.VIBRATE"/>')
+          P.append('<queries><intent><action android:name="android.intent.action.MAIN"/><category android:name="android.intent.category.LAUNCHER"/></intent></queries>')
           if loc:
               P.append('<uses-permission android:name="android.permission.ACCESS_FINE_LOCATION"/>')
               P.append('<uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION"/>')
           if notif:
               P.append('<uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>')
+          if flut:
+              P.append('<uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW"/>')
           service = ('<service android:name=".AutoService" android:exported="true" android:label="%s" android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE"><intent-filter><action android:name="android.accessibilityservice.AccessibilityService"/></intent-filter><meta-data android:name="android.accessibilityservice" android:resource="@xml/auto_config"/></service>' % name) if flut else ''
           meta = ('<meta-data android:name="com.google.android.gms.ads.APPLICATION_ID" android:value="%s"/>' % app) if ads else ''
           manifest = '''<?xml version="1.0" encoding="utf-8"?>
